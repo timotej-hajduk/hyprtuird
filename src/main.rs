@@ -136,11 +136,7 @@ impl HyprlandClient {
         workspace: &Workspace,
         monitor: &Monitor,
     ) -> Result<String> {
-        let workspace_arg = shell_escape_arg(&workspace.name);
-        let monitor_arg = shell_escape_arg(&monitor.name);
-        let response = self.request(&format!(
-            "dispatch moveworkspacetomonitor {workspace_arg} {monitor_arg}"
-        ))?;
+        let response = self.request(&workspace_move_command(workspace, monitor))?;
 
         if response.trim().eq_ignore_ascii_case("ok") {
             Ok(format!(
@@ -637,15 +633,38 @@ fn workspace_label(workspace: &Workspace) -> String {
     }
 }
 
-fn shell_escape_arg(argument: &str) -> String {
-    if argument
-        .chars()
-        .all(|char| char.is_ascii_alphanumeric() || matches!(char, '_' | '-' | '.' | ':'))
-    {
-        return argument.to_string();
-    }
+fn workspace_move_command(workspace: &Workspace, monitor: &Monitor) -> String {
+    // Negative IDs need a name selector; special workspaces already include
+    // their special: prefix in the name returned by Hyprland.
+    let workspace_arg = if workspace.id > 0 {
+        workspace.id.to_string()
+    } else if workspace.name.starts_with("special:") || workspace.name == "special" {
+        lua_string(&workspace.name)
+    } else {
+        lua_string(&format!("name:{}", workspace.name))
+    };
+    let monitor_arg = lua_string(&monitor.name);
+    format!(
+        "dispatch hl.dsp.workspace.move({{ workspace = {workspace_arg}, monitor = {monitor_arg} }})"
+    )
+}
 
-    format!("'{}'", argument.replace('\'', "'\"'\"'"))
+fn lua_string(value: &str) -> String {
+    let mut escaped = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            // Three decimal digits prevent a following digit from becoming
+            // part of the escape. JSON's \\uXXXX escapes are not Lua syntax.
+            '\0'..='\u{1f}' | '\u{7f}' => {
+                escaped.push_str(&format!("\\{:03}", character as u32));
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 #[cfg(test)]
@@ -653,19 +672,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escapes_simple_arguments_without_quotes() {
-        assert_eq!(shell_escape_arg("DP-1"), "DP-1");
-        assert_eq!(shell_escape_arg("name:HDMI-A-1"), "name:HDMI-A-1");
+    fn builds_lua_move_for_numeric_and_named_workspaces() {
+        let monitor = Monitor {
+            id: 0,
+            name: String::from("eDP-1"),
+            focused: false,
+        };
+        for name in ["3", "dev's workspace"] {
+            let workspace = Workspace {
+                id: 3,
+                name: name.into(),
+                monitor: String::from("DP-1"),
+            };
+            assert_eq!(
+                workspace_move_command(&workspace, &monitor),
+                "dispatch hl.dsp.workspace.move({ workspace = 3, monitor = \"eDP-1\" })"
+            );
+        }
     }
 
     #[test]
-    fn escapes_arguments_with_spaces() {
-        assert_eq!(shell_escape_arg("workspace 1"), "'workspace 1'");
+    fn builds_lua_move_for_special_workspace() {
+        let workspace = Workspace {
+            id: -99,
+            name: String::from("special:dev's \"notes\""),
+            monitor: String::from("DP-1"),
+        };
+        let monitor = Monitor {
+            id: 0,
+            name: String::from("eDP-1"),
+            focused: false,
+        };
+        assert_eq!(
+            workspace_move_command(&workspace, &monitor),
+            "dispatch hl.dsp.workspace.move({ workspace = \"special:dev's \\\"notes\\\"\", monitor = \"eDP-1\" })"
+        );
     }
 
     #[test]
-    fn escapes_single_quotes() {
-        assert_eq!(shell_escape_arg("dev's"), "'dev'\"'\"'s'");
+    fn uses_name_selector_for_negative_named_workspace_id() {
+        let workspace = Workspace {
+            id: -1337,
+            name: String::from("dev's workspace"),
+            monitor: String::from("DP-1"),
+        };
+        let monitor = Monitor {
+            id: 0,
+            name: String::from("eDP-1"),
+            focused: false,
+        };
+        assert_eq!(
+            workspace_move_command(&workspace, &monitor),
+            "dispatch hl.dsp.workspace.move({ workspace = \"name:dev's workspace\", monitor = \"eDP-1\" })"
+        );
+    }
+
+    #[test]
+    fn escapes_lua_strings_without_changing_unicode() {
+        assert_eq!(
+            lua_string("dev's \"notes\"\\\n\r\t\0\u{7f}9 日本語"),
+            "\"dev's \\\"notes\\\"\\\\\\010\\013\\009\\000\\1279 日本語\""
+        );
     }
 
     #[test]
